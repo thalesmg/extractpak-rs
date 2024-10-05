@@ -248,7 +248,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut reader = BufReader::new(f);
     let header = PakHeader::read_parse(&mut reader)?;
     dbg!(&header);
-    let num_entries = header.file_entries_size as usize / size_of::<PakHeader>();
+    let num_entries = header.file_entries_size as usize / size_of::<PakFileEntry>();
+    dbg!(num_entries);
     reader.seek(SeekFrom::Start(header.file_entries_start.into()))?;
     let mut entries = vec![];
     for _ in 0..num_entries {
