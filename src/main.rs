@@ -1,6 +1,6 @@
 // https://github.com/timfel/monkey/blob/master/extractpak.c
 
-use std::{env, error::Error, fs::File, io::{BufRead, BufReader, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
+use std::{env, error::Error, fs::File, io::{BufRead, BufReader, Cursor, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
 use std::fs;
 
 type Dword = u32;
@@ -67,6 +67,7 @@ impl PakFileEntry {
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct PixelFormat {
     size: Dword,
     flags: Dword,
@@ -78,6 +79,22 @@ struct PixelFormat {
     alpha_bit_mask: Dword,
 }
 
+impl PixelFormat {
+    fn to_bytes(&self) -> Vec<u8> {
+        vec![
+            self.size.to_le_bytes(),
+            self.flags.to_le_bytes(),
+            self.four_cc.to_le_bytes(),
+            self.rgb_bit_count.to_le_bytes(),
+            self.r_bit_mask.to_le_bytes(),
+            self.g_bit_mask.to_le_bytes(),
+            self.b_bit_mask.to_le_bytes(),
+            self.alpha_bit_mask.to_le_bytes(),
+        ].into_iter().flatten().collect()
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct Caps {
     caps1: Dword,
     caps2: Dword,
@@ -85,6 +102,18 @@ struct Caps {
     reserved: Dword,
 }
 
+impl Caps {
+    fn to_bytes(&self) -> Vec<u8> {
+        vec![
+            self.caps1.to_le_bytes(),
+            self.caps2.to_le_bytes(),
+            self.ddsx.to_le_bytes(),
+            self.reserved.to_le_bytes(),
+        ].into_iter().flatten().collect()
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct DDSHeader {
     magic: Dword,
     size: Dword,
@@ -116,14 +145,16 @@ fn to_dword(buf: &[u8], i: usize) -> Result<Dword, Box<dyn Error>> {
 }
 
 impl DDSHeader {
-    fn parse(dds_data: &[u8], dds_size: Dword) -> Result<Self, Box<dyn Error>> {
+    fn parse<R: BufRead + std::fmt::Debug>(reader: &mut R, dds_size: Dword) -> Result<Self, Box<dyn Error>> {
         const DDS_MAGIC: Dword = u32::from_le_bytes([b' ', b'S', b'D', b'D']);
         const DDS_FLAGS: Dword = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE;
         let size = dds_size - 12;
+        let mut buf = [0; 3 * 4];
+        reader.read_exact(&mut buf)?;
         let pixel_format = PixelFormat {
             size: 32,
             flags: DDPF_FOURCC,
-            four_cc: to_dword(&dds_data, 0)?,
+            four_cc: to_dword(&buf, 0)?,
             alpha_bit_mask: 0,
             r_bit_mask: 0,
             g_bit_mask: 0,
@@ -140,8 +171,8 @@ impl DDSHeader {
             magic: DDS_MAGIC,
             size: 124,
             flags: DDS_FLAGS,
-            height: to_dword(&dds_data, 2)?,
-            width: to_dword(&dds_data, 1)?,
+            height: to_dword(&buf, 2)?,
+            width: to_dword(&buf, 1)?,
             pitch_or_linear_size: size,
             depth: 0,
             mip_map_count: 0,
@@ -152,8 +183,33 @@ impl DDSHeader {
         })
     }
 
-    fn write(buf: &mut [u8], dds_header: Self, filename: &Path, dds_size: Dword) {
+    fn to_bytes(&self) -> Vec<u8> {
+        vec![
+            self.magic.to_le_bytes().to_vec(),
+            self.size.to_le_bytes().to_vec(),
+            self.flags.to_le_bytes().to_vec(),
+            self.height.to_le_bytes().to_vec(),
+            self.width.to_le_bytes().to_vec(),
+            self.pitch_or_linear_size.to_le_bytes().to_vec(),
+            self.depth.to_le_bytes().to_vec(),
+            self.mip_map_count.to_le_bytes().to_vec(),
+            self.reserved.into_iter().flat_map(u32::to_le_bytes).collect(),
+            self.pixel_format.to_bytes(),
+            self.caps.to_bytes(),
+            self.reserved2.to_le_bytes().to_vec(),
+        ].concat()
+    }
 
+    fn write<R: BufRead>(reader: &mut R, dds_header: Self, filename: &Path, dds_size: Dword) -> Result<(), Box<dyn Error>> {
+        // already read 3 "dwords"
+        let dds_size = dds_size - 3 * 4;
+        let header_bytes = dds_header.to_bytes();
+        let mut f = File::create(filename)?;
+        f.write_all(&header_bytes)?;
+        let mut buf = vec![0; dds_size as usize];
+        reader.read_exact(&mut buf)?;
+        f.write_all(&buf)?;
+        Ok(())
     }
 }
 
@@ -169,15 +225,16 @@ fn extract_file<R: BufRead + Seek>(
     fs::create_dir_all(dir)?;
     let mut f = File::create(path)?;
     reader.seek(SeekFrom::Start((header.data_start + entry.data_pos).into()))?;
-    let mut buf = Vec::with_capacity(entry.data_size.try_into()?);
+    let mut buf = vec![0; entry.data_size.try_into()?];
     reader.read_exact(&mut buf)?;
     f.write_all(&buf)?;
     let path = basedir.join(Path::new(filename));
     if let Some("dxt") = path.extension().map(|os| os.to_str()).flatten() {
-        let dds_header = DDSHeader::parse(&mut buf, entry.data_size)?;
-        let filename: PathBuf = path.with_extension("dds");
         let dds_size = entry.data_size;
-        DDSHeader::write(&mut buf, dds_header, filename.as_path(), dds_size);
+        let mut cursor = Cursor::new(buf);
+        let dds_header = DDSHeader::parse(&mut cursor, dds_size)?;
+        let filename: PathBuf = path.with_extension("dds");
+        DDSHeader::write(&mut cursor, dds_header, filename.as_path(), dds_size)?;
     }
     Ok(())
 }
@@ -199,15 +256,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         entries.push(entry);
     }
     dbg!(&entries[0..3]);
-    let mut filename_buf = vec![];
     for entry in entries {
+        let mut filename_buf = vec![];
         reader.seek(SeekFrom::Start((entry.filename_pos + header.file_names_start).into()))?;
         reader.read_until(0x0, &mut filename_buf)?;
         let filename: String = String::from_utf8(filename_buf)?;
         let filename: &str = filename.trim_end_matches('\0');
         dbg!(&filename);
-        // extract_file(&mut reader, basedir, filename, &entry, &header)?;
-        break
+        extract_file(&mut reader, basedir, filename, &entry, &header)?;
     }
     Ok(())
 }
